@@ -57,8 +57,35 @@ on:
           - SukiSU
           - ReSukiSU
         default: ReSukiSU
+
+      # ★ 新增：KSU 版本选择器（替代原来形同虚设的 kernelsu_branch）
+      #   说明：原来 Stable/Dev 对 Official 都落到 -s main，选项无实际作用，
+      #   且内核版本由脚本自算(20000+commit数)，与上游真实版本脱节，
+      #   导致内核版本(32653) 高于管理器预构建版本(32632) 而无法匹配。
+      #   现在改为显式选择上游 ref，内核与管理器从同一来源取版本。
+      ksu_version:
+        description: "KSU 版本（决定内核与管理器版本，强烈建议用具体 tag）"
+        required: true
+        type: choice
+        options:
+          - "latest (跟随上游最新)"
+          - "v3.2.653"
+          - "v3.1.0"
+          - "v3.0.0"
+          - "v1.0.1"
+          - "v1.0.0"
+          - "v0.9.5"
+          - "custom (用下方自定义 ref)"
+        default: "latest (跟随上游最新)"
+
+      ksu_custom_ref:
+        description: "自定义 KSU ref（仅当上面选 custom 时生效；可填 tag / 分支 / commit）"
+        required: false
+        type: string
+        default: ""
+
       kernelsu_branch:
-        description: "KSU 分支"
+        description: "KSU 分支（旧选项，仅 SukiSU/ReSukiSU 生效）"
         required: true
         type: choice
         options:
@@ -139,6 +166,9 @@ jobs:
       revision: ${{ inputs.revision || '' }}
       ksu_variant: ${{ inputs.kernelsu_variant }}
       ksu_branch: ${{ inputs.kernelsu_branch }}
+      # ★ 新增透传：内核侧按此 ref 取源码
+      ksu_version: ${{ inputs.ksu_version }}
+      ksu_custom_ref: ${{ inputs.ksu_custom_ref || '' }}
       version: ${{ inputs.version || '' }}
       build_time: ${{ inputs.build_time || '' }}
       use_zram: ${{ inputs.use_zram }}
@@ -150,7 +180,14 @@ jobs:
       droidspaces: ${{ inputs.droidspaces || 'off' }}
 
   get-ksu-manager:
+    # ★ 管理器改为从上游 Releases 取正式版，且必须等内核侧解析出真实版本后再取，
+    #   以便校验“管理器版本 >= 内核版本”，避免再次出现 32632 < 32653 的错配。
+    needs: build-custom-kernel
     uses: ./.github/workflows/get-manager.yml
     secrets: inherit
     with:
       kernelsu_variant: ${{ inputs.kernelsu_variant }}
+      ksu_version: ${{ inputs.ksu_version }}
+      ksu_custom_ref: ${{ inputs.ksu_custom_ref || '' }}
+      # 用内核侧输出的真实版本号做校验（见 build.yml 新增 outputs）
+      kernel_ksu_version: ${{ needs.build-custom-kernel.outputs.ksu_version_code || '' }}
