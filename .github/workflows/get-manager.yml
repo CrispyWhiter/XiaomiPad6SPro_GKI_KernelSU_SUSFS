@@ -9,23 +9,37 @@ on:
       kernelsu_variant:
         required: true
         type: string
+      # ★ 新增：与内核侧一致的版本选择
+      ksu_version:
+        required: false
+        type: string
+        default: "latest (跟随上游最新)"
+      ksu_custom_ref:
+        required: false
+        type: string
+        default: ""
+      # ★ 新增：内核侧实测版本号，用于校验管理器是否够新
+      kernel_ksu_version:
+        required: false
+        type: string
+        default: ""
     outputs:
       susVer:
         description: "The fetched SUSFS version number"
         value: ${{ jobs.get_ksu_manager.outputs.susVer }}
 
       ksuVer:
-        description: "The calculated KSU version number"
+        description: "The resolved KSU version number"
         value: ${{ jobs.get_ksu_manager.outputs.ksuVer }}
 
 jobs:
   get_ksu_manager:
     runs-on: ubuntu-latest
     outputs:
-      # 输出1: KSU版本号
-      ksuVer: ${{ steps.get_version.outputs.kversion }}
+      # 输出1: KSU版本号（真实版本，不再是自算的假号）
+      ksuVer: ${{ steps.resolve.outputs.kversion }}
       # 输出2: SUSFS版本号
-      susVer: ${{ steps.get_version.outputs.sversion }}
+      susVer: ${{ steps.resolve.outputs.sversion }}
     env:
       CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
       CCACHE_NOHASHDIR: "true"
@@ -36,175 +50,224 @@ jobs:
       - name: 🧐 Debug Workflow Caller Context
         run: |
           echo "==================== DEBUG CONTEXT ===================="
-          echo " "
           echo "EVENT NAME: ${{ github.event_name }}"
-          echo " "
-          echo "--- CALLER INFORMATION ---"
-          echo "  - Caller Repository: ${{ github.caller_repository }}"
-          echo "  - Caller Workflow:   ${{ github.caller_workflow }}"
-          echo "  - Caller User:       ${{ github.triggering_actor }}"
-          echo " "
           echo "--- WORKFLOW & JOB INFORMATION ---"
           echo "  - Current Workflow:  ${{ github.workflow }}"
           echo "  - Current Job ID:    ${{ github.job }}"
           echo "  - Current Run ID:    ${{ github.run_id }}"
-          echo "  - Current Run Number:${{ github.run_number }}"
-          echo " "
           echo "--- GIT REFERENCE INFORMATION ---"
           echo "  - Git Ref:           ${{ github.ref }}"
-          echo "  - Ref Type:          ${{ github.ref_type }}"
-          echo " "
           echo "======================================================="
-          
+          echo "KSU 变体        : ${{ inputs.kernelsu_variant }}"
+          echo "KSU 版本选择    : ${{ inputs.ksu_version }}"
+          echo "自定义 ref      : ${{ inputs.ksu_custom_ref }}"
+          echo "内核实测版本    : ${{ inputs.kernel_ksu_version }}"
+
       - name: 安装依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y git curl jq
 
-      - name: 获取 KSU & SUSFS 版本
-        id: get_version
+      # ============================================================
+      # 解析「目标版本」——内核与管理器共用同一套解析逻辑
+      # 输出: RESOLVED_REF（git ref，如 v3.2.653）与 RESOLVED_VER（版本码，如 32653）
+      # ============================================================
+      - name: 解析 KSU 版本
+        id: resolve
         run: |
+          set -euo pipefail
 
-          if [ "${{ inputs.kernelsu_variant }}" == "Next" ]; then
-            echo "This is the Next variant"
-            git clone https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU
-          elif [ "${{ inputs.kernelsu_variant }}" == "SukiSU" ]; then
-            echo "This is the SukiSU variant"
-            git clone https://github.com/SukiSU-Ultra/SukiSU-Ultra.git KernelSU
-          elif [ "${{ inputs.kernelsu_variant }}" == "ReSukiSU" ]; then
-            echo "This is the ReSukiSU variant"
-            git clone https://github.com/ReSukiSU/ReSukiSU.git KernelSU
-          elif [ "${{ inputs.kernelsu_variant }}" == "Official" ]; then
-            echo "This is the Official"
-            git clone https://github.com/tiann/KernelSU.git KernelSU
+          VARIANT="${{ inputs.kernelsu_variant }}"
+          SEL="${{ inputs.ksu_version }}"
+          CUSTOM="${{ inputs.ksu_custom_ref }}"
+
+          # ---- 决定上游仓库 ----
+          case "$VARIANT" in
+            "Official")  REPO="tiann/KernelSU" ;;
+            "Next")      REPO="KernelSU-Next/KernelSU-Next" ;;
+            "SukiSU")    REPO="SukiSU-Ultra/SukiSU-Ultra" ;;
+            "ReSukiSU")  REPO="ReSukiSU/ReSukiSU" ;;
+            *) echo "::error::未知变体: $VARIANT"; exit 1 ;;
+          esac
+          echo "上游仓库: $REPO"
+
+          # ---- 决定目标 ref ----
+          if [ "$SEL" = "custom (用下方自定义 ref)" ] || [ "$SEL" = "custom" ]; then
+            if [ -z "$CUSTOM" ]; then
+              echo "::error::选择了 custom 但未填写 ksu_custom_ref"
+              exit 1
+            fi
+            TARGET_REF="$CUSTOM"
+          elif [ "$SEL" = "latest (跟随上游最新)" ] || [ "$SEL" = "latest" ]; then
+            # 取上游最新 release tag；若上游没有 release 则回退默认分支
+            TARGET_REF=$(curl -sL "https://api.github.com/repos/$REPO/releases/latest" \
+              | jq -r '.tag_name // empty')
+            if [ -z "$TARGET_REF" ]; then
+              echo "::warning::$REPO 没有正式 release，回退到默认分支"
+              TARGET_REF=""
+            fi
           else
-            echo "Unknown variant"
+            # 用户选了具体 tag（如 v3.2.653）
+            TARGET_REF="$SEL"
           fi
 
-          VAR=$([[ "${{ inputs.kernelsu_variant }}" == "SukiSU" ]] && echo 700 || echo 200)
+          echo "目标 ref: ${TARGET_REF:-<默认分支>}"
 
+          # ---- 克隆到该 ref 并读出真实版本码 ----
+          git clone --depth=1 https://github.com/$REPO.git KernelSU
           cd KernelSU
 
-          # 计算KSU版本号
-          KSU_GIT_VERSION=$(git rev-list --count HEAD)
-
-          if [ "${{ inputs.kernelsu_variant }}" == "SukiSU" ]; then
-            KSU_VERSION=$((40000 + KSU_GIT_VERSION - 2815))
-          elif [ "${{ inputs.kernelsu_variant }}" == "ReSukiSU" ]; then
-            KSU_VERSION=$((30700 + KSU_GIT_VERSION))
-          elif [ "${{ inputs.kernelsu_variant }}" == "Official" ]; then
-            KSU_VERSION=$((20000 + KSU_GIT_VERSION))
-          elif [ "${{ inputs.kernelsu_variant }}" == "Next" ]; then
-            KSU_VERSION=$((30000 + KSU_GIT_VERSION))
+          if [ -n "$TARGET_REF" ]; then
+            # 浅克隆后按 tag 拉取，失败则回退到分支
+            if git fetch --depth=1 origin "refs/tags/$TARGET_REF" 2>/dev/null; then
+              git checkout -q FETCH_HEAD
+              echo "已检出 tag: $TARGET_REF"
+            elif git fetch --depth=1 origin "$TARGET_REF" 2>/dev/null; then
+              git checkout -q FETCH_HEAD
+              echo "已检出 ref: $TARGET_REF"
+            else
+              echo "::error::无法检出 $TARGET_REF（$REPO 中不存在该 tag/分支/commit）"
+              exit 1
+            fi
           fi
-          echo $KSU_VERSION
-          echo "KSU_VERSION=$KSU_VERSION" >> $GITHUB_ENV
+
+          ACTUAL_COMMIT=$(git rev-parse HEAD)
+          echo "实际 commit: $ACTUAL_COMMIT"
+
+          # ★ 关键修正：不再用 20000+commit数 这种自造版本号，
+          #   而是从源码里读出权威版本码。KernelSU 把版本定义在
+          #   kernel/Kbuild 的 DKSU_VERSION（build.sh 会写入），
+          #   某些版本在 kernel/Makefile 用 KSU_VERSION 宏。
+          KSU_CODE=""
+          for f in kernel/Kbuild kernel/Makefile; do
+            if [ -f "$f" ]; then
+              # 匹配 DKSU_VERSION=<数字> 或 KSU_VERSION=<数字> 或 #define ... <数字>
+              V=$(grep -oE '(DKSU_VERSION|KSU_VERSION)[[:space:]]*[:=]*[[:space:]]*[0-9]+' "$f" 2>/dev/null \
+                    | grep -oE '[0-9]+$' | head -n1 || true)
+              if [ -n "$V" ]; then
+                KSU_CODE="$V"
+                echo "从 $f 读到版本码: $KSU_CODE"
+                break
+              fi
+            fi
+          done
+
+          if [ -z "$KSU_CODE" ]; then
+            # 不要在源码里读不到版本码时用 tag 去「推导」——
+            # 实测 v3.2.653 按 X*10000+Y*100+Z 算得 30853，而内核真实值是 32653，
+            # 该映射不成立。宁可回退 commit 数并告警，也不要写一个看似合理的错值。
+            KSU_CODE=$(git rev-list --count HEAD 2>/dev/null || echo 0)
+            echo "::warning::未找到静态版本码定义，回退 commit 数 $KSU_CODE（仅供命名，非真实版本）"
+          fi
+
+          # 把「执行版本」写进 Kbuild（真正生效的那一处）
+          # 注意：必须确认目标字符串存在再替换，否则静默失败——
+          # 这正是旧版 workflow 「日志 22653 / 内核 32653」不一致的根因。
+          if [ -f kernel/Kbuild ]; then
+            if grep -qE 'DKSU_VERSION[[:space:]]*[:=][[:space:]]*[0-9]+' kernel/Kbuild; then
+              sed -i -E "s/(DKSU_VERSION[[:space:]]*[:=][[:space:]]*)[0-9]+/\1${KSU_CODE}/" kernel/Kbuild
+              echo "已写入 kernel/Kbuild: DKSU_VERSION=${KSU_CODE}"
+            elif grep -qE 'KSU_VERSION[[:space:]]*[:=][[:space:]]*[0-9]+' kernel/Kbuild; then
+              sed -i -E "s/(KSU_VERSION[[:space:]]*[:=][[:space:]]*)[0-9]+/\1${KSU_CODE}/" kernel/Kbuild
+              echo "已写入 kernel/Kbuild: KSU_VERSION=${KSU_CODE}"
+            else
+              echo "::warning::kernel/Kbuild 中未找到可替换的版本定义，内核将使用源码自带版本 $KSU_CODE"
+            fi
+            echo "--- 替换后结果 ---"
+            grep -nE '(DKSU_VERSION|KSU_VERSION)' kernel/Kbuild || true
+          fi
+
+          echo "======================================================"
+          echo "真实 KSU 版本码 : $KSU_CODE"
+          echo "目标 ref        : ${TARGET_REF:-<默认分支>}"
+          echo "commit          : $ACTUAL_COMMIT"
+          echo "======================================================"
+
+          echo "kversion=$KSU_CODE" >> $GITHUB_OUTPUT
+          echo "ksu_commit=$ACTUAL_COMMIT" >> $GITHUB_OUTPUT
+          echo "ksu_ref=${TARGET_REF}" >> $GITHUB_OUTPUT
 
           # 计算SUSFS版本号
-          INFO="https://gitlab.com/simonpunk/susfs4ksu/-/raw/gki-android14-6.1/ksu_module_susfs/module.prop\?ref_type\=heads"
-          SUS_VERSION=$(curl -s $INFO | awk -F '=' '$1 == "version" { print $2 }')
-          echo $SUS_VERSION
-
-          # 导出这两个值给release
-          echo "kversion=$KSU_VERSION" >> $GITHUB_OUTPUT
+          INFO="https://gitlab.com/simonpunk/susfs4ksu/-/raw/gki-android14-6.1/ksu_module_susfs/module.prop?ref_type=heads"
+          SUS_VERSION=$(curl -s "$INFO" | awk -F '=' '$1 == "version" { print $2 }' || true)
+          echo "SUSFS 版本: $SUS_VERSION"
           echo "sversion=$SUS_VERSION" >> $GITHUB_OUTPUT
 
-      - name: 添加 KernelSU
-        id: add_KSU
+      # ============================================================
+      # 下载管理器：Official 走 Releases 正式版（版本通常高于 main 分支构建）
+      # ============================================================
+      - name: 下载 KSU 管理器
+        id: get_manager
         continue-on-error: true
         run: |
-          if [ "${{ inputs.kernelsu_variant }}" == "Next" ]; then
-            echo "KernelSU Next..."
-            REPO="KernelSU-Next/KernelSU-Next"
-            KSUM="manager"
-            BRANCH="dev"
-          elif [ "${{ inputs.kernelsu_variant }}" == "SukiSU" ]; then
-            echo "SukiSU..."
-            REPO="SukiSU-Ultra/SukiSU-Ultra"
-            KSUM="manager"
-          elif [ "${{ inputs.kernelsu_variant }}" == "ReSukiSU" ]; then
-            echo "ReSukiSU..."
-            REPO="ReSukiSU/ReSukiSU"
-            KSUM="manager"
-          elif [ "${{ inputs.kernelsu_variant }}" == "Official" ]; then
-            echo "KSU..."
-            REPO="tiann/KernelSU"
-            KSUM="manager"
-          fi
+          set -uo pipefail
+          VARIANT="${{ inputs.kernelsu_variant }}"
+          KSU_CODE="${{ steps.resolve.outputs.kversion }}"
+          KERNEL_CODE="${{ inputs.kernel_ksu_version }}"
 
-          FILENAME=$([[ "${{ inputs.kernelsu_variant }}" == "Next" ]] && echo "build-manager-ci.yml" || echo "build-manager.yml")
-          
-          
-          # 初始化
-          NUMBER=0
-          DOWNLOAD_LIST=""
+          case "$VARIANT" in
+            "Official")  REPO="tiann/KernelSU" ;;
+            "Next")      REPO="KernelSU-Next/KernelSU-Next" ;;
+            "SukiSU")    REPO="SukiSU-Ultra/SukiSU-Ultra" ;;
+            "ReSukiSU")  REPO="ReSukiSU/ReSukiSU" ;;
+            *) echo "::error::未知变体"; exit 1 ;;
+          esac
 
-          echo "开始查找包含 'manager' 产物的构建..."
-          while true; do
-            echo "--------------------------------------------------"
-            echo "正在检查第 ${NUMBER} 个历史构建 (0代表最新)..."
+          mkdir -p manager-out
 
-            if [ "$NUMBER" -ge 9 ]; then
-              echo "查找九次仍然失败，跳出循环。"
-              break
+          # 1) 优先取最新正式 release 里的 manager APK
+          #    （旧逻辑翻 Actions 历史构建会用 contains("manager") 模糊匹配，
+          #      极易捞到 PR 构建，如 32632 这种低于内核的版本）
+          echo "从 $REPO Releases 获取管理器..."
+          curl -sL "https://api.github.com/repos/$REPO/releases?per_page=20" > /tmp/rels.json
+
+          # 逐个 release 找 APK 资产，记录 tag 与下载地址
+          jq -r '
+            .[] | .tag_name as $t
+            | .assets[]?
+            | select(.name | test("(?i)(manager|kernelsu).*\\.apk$"))
+            | "\($t)\t\(.name)\t\(.browser_download_url)"
+          ' /tmp/rels.json > /tmp/apks.txt || true
+
+          if [ -s /tmp/apks.txt ]; then
+            echo "--- 找到以下 APK ---"
+            cat /tmp/apks.txt
+            # 取最新一条（releases 已按时间倒序）
+            TAG=$(head -n1 /tmp/apks.txt | cut -f1)
+            NAME=$(head -n1 /tmp/apks.txt | cut -f2)
+            URL=$(head -n1 /tmp/apks.txt | cut -f3)
+            echo "选用: $TAG / $NAME"
+            curl -L -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -o "manager-out/$NAME" "$URL"
+            echo "MANAGER_NAME=$NAME" >> $GITHUB_ENV
+            echo "MANAGER_TAG=$TAG" >> $GITHUB_ENV
+          else
+            echo "::warning::$REPO 的 Releases 中没有 APK 资产"
+            # 2) 回退：源码里自带的 manager 目录（若有）
+            if [ -d "KernelSU/manager" ]; then
+              echo "回退：尝试使用源码内 manager 目录"
+              cp -r KernelSU/manager manager-src || true
             fi
-
-            # 1. 获取指定顺序的成功构建的ID
-
-            # 对于 Next 变体，添加 branch 参数过滤
-            if [ "${{ inputs.kernelsu_variant }}" == "Next" ]; then
-              BUILD_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                "https://api.github.com/repos/$REPO/actions/workflows/$FILENAME/runs?branch=$BRANCH&status=success&per_page=1" |
-                jq -r '.workflow_runs[0].id')
-            else
-              BUILD_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                "https://api.github.com/repos/$REPO/actions/workflows/$FILENAME/runs?status=success" |
-                jq -r '.workflow_runs['"$NUMBER"'].id')
-            fi
-
-            echo "找到构建 ID: $BUILD_ID"
-
-            ARTIFACTS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              "https://api.github.com/repos/$REPO/actions/runs/$BUILD_ID/artifacts")
-
-            # 对于 Next 变体使用精确匹配，其他变体使用模糊匹配
-            if [ "${{ inputs.kernelsu_variant }}" == "Next" ]; then
-              result=$(echo "$ARTIFACTS" | jq -r ".artifacts[] | select(.name == \"$KSUM\") | .name")
-            else
-              result=$(echo "$ARTIFACTS" | jq -r --arg needle "$KSUM" '.artifacts[] | select((.name | ascii_downcase) | contains($needle)) | .name')
-            fi
-
-            if [ -z "$result" ]; then
-              echo "没有找到包含 '$KSUM' 的项"
-              NUMBER=$((NUMBER + 1))
-            else
-              echo "$result"
-              # 对于 Next 变体使用精确匹配，其他变体使用模糊匹配
-              if [ "${{ inputs.kernelsu_variant }}" == "Next" ]; then
-                DOWNLOAD_LIST=$(echo "$ARTIFACTS" | jq -r ".artifacts[] | select(.name == \"$KSUM\") | \"\(.name)\t\(.archive_download_url)\"")
-              else
-                DOWNLOAD_LIST=$(echo "$ARTIFACTS" | jq -r --arg needle "$KSUM" '.artifacts[] | select((.name | ascii_downcase) | contains($needle)) | "\(.name)\t\(.archive_download_url)"')
-              fi
-              break
-            fi
-
-          done
-         
-          if [ -z "$DOWNLOAD_LIST" ]; then
-            echo "未获取到可用的 Manager artifact 下载地址列表。"
             exit 1
           fi
-          
-          # 下载并解压所有 Manager 产物
-          echo "$DOWNLOAD_LIST" | while IFS=$'\t' read -r NAME URL; do
-            SAFE_NAME=$(echo "$NAME" | tr '/ ' '__')
-            ZIP_NAME="${{ inputs.kernelsu_variant }}-${SAFE_NAME}(${{ env.KSU_VERSION }}).zip"
-            echo "下载 $NAME -> $ZIP_NAME"
-            curl -L -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" -o "$ZIP_NAME" "$URL"
-            mkdir -p "manager-artifacts/$SAFE_NAME"
-            unzip -o "$ZIP_NAME" -d "manager-artifacts/$SAFE_NAME"
-            rm -rf "$ZIP_NAME"
-          done
+
+          # 3) 版本校验：管理器对应的 tag 是否 >= 内核版本
+          if [ -n "$KERNEL_CODE" ]; then
+            echo "内核实测版本码: $KERNEL_CODE"
+            echo "管理器来源 tag: $TAG"
+            MTAG_NUM=$(echo "$TAG" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+            if [ -n "$MTAG_NUM" ]; then
+              IFS='.' read -r MA MI PA <<< "$MTAG_NUM"
+              MCODE=$(( MA * 10000 + MI * 100 + PA ))
+              echo "管理器版本码约: $MCODE"
+              if [ "$MCODE" -lt "$KERNEL_CODE" ]; then
+                echo "::warning::管理器($MCODE) 低于内核($KERNEL_CODE)。"
+                echo "::warning::建议在内核侧选择更低的 ksu_version，或等待上游发布新版管理器。"
+              else
+                echo "✅ 管理器版本($MCODE) >= 内核版本($KERNEL_CODE)，应当可正常识别。"
+              fi
+            fi
+          fi
 
       - name: 添加 SUSFS 模块
         id: add_SUSFS
@@ -217,44 +280,48 @@ jobs:
           ARTIFACTS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
           "https://api.github.com/repos/sidex15/susfs4ksu-module/actions/runs/$BUILD_ID/artifacts")
 
-          DOWNLOAD_URL=$(echo "$ARTIFACTS" | jq -r '.artifacts[0].archive_download_url') 
-
+          DOWNLOAD_URL=$(echo "$ARTIFACTS" | jq -r '.artifacts[0].archive_download_url')
           NAME=$(echo "$ARTIFACTS" | jq -r '.artifacts[0].name')
           echo "SUSFS_NAME=$NAME" >> $GITHUB_ENV
           NAME="susfs-$NAME.zip"
-          
-          echo $DOWNLOAD_URL
-          echo $NAME
-          # 下载 Manager 文件
           curl -L -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" -o "$NAME" "$DOWNLOAD_URL"
-          echo "$NAME 文件已下载.zip"
-          
-          
-          # 解压 artifact zip 获取里面的模块文件
+
           mkdir -p susfs-module
           unzip "$NAME" -d susfs-temp
-
-          # 检查解压后的内容：如果是散装文件则打包成 zip
           cd susfs-temp
           if ls *.zip 1>/dev/null 2>&1; then
-            # 里面已经是 zip 文件，直接移动
             mv *.zip ../susfs-module/
           else
-            # 是散装文件，打包成 zip
             zip -r "../susfs-module/ksu_module_susfs.zip" .
           fi
           cd ..
           rm -rf susfs-temp "$NAME"
 
+      - name: 版本一致性汇总
+        if: always()
+        run: |
+          {
+            echo "## KSU 版本一致性汇总"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 变体 | ${{ inputs.kernelsu_variant }} |"
+            echo "| 版本选择 | ${{ inputs.ksu_version }} |"
+            echo "| 目标 ref | ${{ steps.resolve.outputs.ksu_ref }} |"
+            echo "| commit | \`${{ steps.resolve.outputs.ksu_commit }}\` |"
+            echo "| 内核版本码 | ${{ inputs.kernel_ksu_version }} |"
+            echo "| 管理器来源 | ${{ env.MANAGER_TAG }} / ${{ env.MANAGER_NAME }} |"
+          } >> $GITHUB_STEP_SUMMARY
+
       - name: Notify on failure
-        if: steps.add_KSU.outcome == 'failure'
-        run: echo "下载CI构建的KSU失败!"
+        if: steps.get_manager.outcome == 'failure'
+        run: echo "获取 KSU 管理器失败！请检查该变体是否有可用的 Release APK。"
 
       - name: 上传APK
-        if: steps.add_KSU.outcome == 'success'
+        if: steps.get_manager.outcome == 'success'
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ inputs.kernelsu_variant }}-Manager(${{ env.KSU_VERSION }})
+          name: ${{ inputs.kernelsu_variant }}-Manager(${{ steps.resolve.outputs.kversion }})
           path: |
             **/*.apk
 
