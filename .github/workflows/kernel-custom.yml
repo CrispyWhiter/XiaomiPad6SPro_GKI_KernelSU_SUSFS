@@ -68,8 +68,8 @@ on:
         required: true
         type: choice
         options:
-          - "latest (跟随上游最新)"
-          - "v3.2.653"
+          - "latest (跟随上游最新，这个选项有时候有bug，不建议使用)"
+          - "v3.3.0"
           - "v3.1.0"
           - "v3.0.0"
           - "v1.0.1"
