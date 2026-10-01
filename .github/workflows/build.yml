@@ -28,6 +28,16 @@ on:
       ksu_branch:
         required: true
         type: string
+      # ★ 新增：KSU 版本选择（tag / 分支 / commit / latest）
+      ksu_version:
+        required: false
+        type: string
+        default: "latest (跟随上游最新)"
+      # ★ 新增：选 custom 时的自定义 ref
+      ksu_custom_ref:
+        required: false
+        type: string
+        default: ""
 
       # ==================== 可选配置 ====================
       version:
@@ -71,11 +81,25 @@ on:
         type: string
         default: "off"
 
+    # ★ 新增：把内核实测的真实 KSU 版本码与 ref 暴露给调用方，
+    #   供 get-manager 校验「管理器版本 >= 内核版本」
+    outputs:
+      ksu_version_code:
+        description: "内核实际编入的 KSU 版本码"
+        value: ${{ jobs.build-kernel.outputs.ksu_version_code }}
+      ksu_resolved_ref:
+        description: "实际使用的 KSU ref"
+        value: ${{ jobs.build-kernel.outputs.ksu_resolved_ref }}
+
 jobs:
   build-kernel:
     name: "${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.android_version }}-${{ inputs.os_patch_level }}-${{ inputs.ksu_variant }}"
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    outputs:
+      # ★ 新增：供 get-manager 做版本校验
+      ksu_version_code: ${{ steps.ksu-version.outputs.ksu_code }}
+      ksu_resolved_ref: ${{ steps.ksu-version.outputs.ksu_ref }}
 
     env:
       CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
@@ -94,6 +118,8 @@ jobs:
           echo "补丁级别      : ${{ inputs.os_patch_level }}"
           echo "KSU 变体      : ${{ inputs.ksu_variant }}"
           echo "KSU 分支      : ${{ inputs.ksu_branch }}"
+          echo "KSU 版本选择  : ${{ inputs.ksu_version }}"
+          echo "KSU 自定义 ref: ${{ inputs.ksu_custom_ref }}"
           echo "构建时间      : ${{ inputs.build_time }}"
           echo "SUSFS 状态    : ${{ inputs.enable_susfs }}"
           echo "ZRAM 增强     : ${{ inputs.use_zram }}"
@@ -353,76 +379,170 @@ jobs:
           curl -LSs "https://github.com/zzh20188/GKI_KernelSU_SUSFS/raw/refs/heads/dev/hmbird_patch.c" -o hmbird_patch.c
           echo "obj-y += hmbird_patch.o" >> Makefile
 
-      - name: 确定 KernelSU 分支
-        id: ksu-branch
+      # ============================================================
+      # ★ 改造点 B：「确定 KernelSU 版本与分支」
+      #   原步骤只决定 -s 分支参数（Official 固定 main），
+      #   现改为按用户选的 ksu_version 解析出确定 ref，并输出给后续步骤。
+      # ============================================================
+      - name: 确定 KernelSU 版本与分支
+        id: ksu-version
         run: |
-          branch_input="${{ inputs.ksu_branch }}"
+          set -uo pipefail
+
           variant_input="${{ inputs.ksu_variant }}"
+          branch_input="${{ inputs.ksu_branch }}"
+          sel="${{ inputs.ksu_version }}"
+          custom="${{ inputs.ksu_custom_ref }}"
 
-          if [ "$variant_input" = "ReSukiSU" ]; then
-            BRANCH="-s main"
-          else
-            case "$branch_input" in
-              "Stable(标准)")
-                case "$variant_input" in
-                  "Next") ;;
-                  "SukiSU") BRANCH="-s builtin" ;;
-                  "Official") BRANCH="-s main" ;;
-                  *) BRANCH="-" ;;
-                esac
-                ;;
-              "Dev(开发)")
-                case "$variant_input" in
-                  "Official") BRANCH="-s main" ;;
-                  "Next") ;;
-                  "SukiSU") BRANCH="-s builtin" ;;
-                  *) echo "未知变体: $variant_input" >&2; exit 1 ;;
-                esac
-                ;;
-              *)
-                echo "未知分支: $branch_input" >&2
+          KSU_REF=""
+
+          if [ "$variant_input" = "Official" ]; then
+            # ---------- Official：由 ksu_version 决定 ref ----------
+            if [ "$sel" = "custom (用下方自定义 ref)" ] || [ "$sel" = "custom" ]; then
+              if [ -z "$custom" ]; then
+                echo "::error::选择了 custom 但 ksu_custom_ref 为空"
                 exit 1
-                ;;
-            esac
+              fi
+              KSU_REF="$custom"
+            elif [ "$sel" = "latest (跟随上游最新)" ] || [ "$sel" = "latest" ]; then
+              KSU_REF=""   # 空 = 跟随上游默认分支
+            else
+              KSU_REF="$sel"   # 具体 tag，如 v3.2.653
+            fi
 
-            # SukiSU 不启用 SUSFS 时强制使用 main 分支
-            if [ "$variant_input" = "SukiSU" ] && [ "${{ inputs.enable_susfs }}" = "false" ]; then
+            if [ -n "$KSU_REF" ]; then
+              BRANCH="-s $KSU_REF"
+            else
               BRANCH="-s main"
             fi
-          fi
+            echo "Official 目标 ref: ${KSU_REF:-<main>}"
 
-          # 检查自定义提交 (仅对 SukiSU 生效)
-          CONFIG_FILE="config/config"
-          if [ -f "$CONFIG_FILE" ]; then
-            CUSTOM_ENABLED=$(grep "^custom=" "$CONFIG_FILE" | cut -d'=' -f2)
-            if [ "$CUSTOM_ENABLED" == "true" ] && [ "$variant_input" == "SukiSU" ]; then
-              SUKISU_COMMIT=$(grep "^sukisu=" "$CONFIG_FILE" | cut -d'=' -f2)
-              if [ -n "$SUKISU_COMMIT" ]; then
-                BRANCH="-s $SUKISU_COMMIT"
-                echo "SukiSU 使用自定义提交: $SUKISU_COMMIT"
+          else
+            # ---------- 非 Official：维持原有分支语义 ----------
+            if [ "$variant_input" = "ReSukiSU" ]; then
+              BRANCH="-s main"
+            else
+              case "$branch_input" in
+                "Stable(标准)")
+                  case "$variant_input" in
+                    "Next") ;;
+                    "SukiSU") BRANCH="-s builtin" ;;
+                    *) BRANCH="-" ;;
+                  esac
+                  ;;
+                "Dev(开发)")
+                  case "$variant_input" in
+                    "Next") ;;
+                    "SukiSU") BRANCH="-s builtin" ;;
+                    *) echo "未知变体: $variant_input" >&2; exit 1 ;;
+                  esac
+                  ;;
+                *)
+                  echo "未知分支: $branch_input" >&2
+                  exit 1
+                  ;;
+              esac
+
+              # SukiSU 不启用 SUSFS 时强制使用 main 分支
+              if [ "$variant_input" = "SukiSU" ] && [ "${{ inputs.enable_susfs }}" = "false" ]; then
+                BRANCH="-s main"
+              fi
+            fi
+
+            # 检查自定义提交 (仅对 SukiSU 生效)
+            CONFIG_FILE="config/config"
+            if [ -f "$CONFIG_FILE" ]; then
+              CUSTOM_ENABLED=$(grep "^custom=" "$CONFIG_FILE" | cut -d'=' -f2 || true)
+              if [ "$CUSTOM_ENABLED" == "true" ] && [ "$variant_input" == "SukiSU" ]; then
+                SUKISU_COMMIT=$(grep "^sukisu=" "$CONFIG_FILE" | cut -d'=' -f2 || true)
+                if [ -n "$SUKISU_COMMIT" ]; then
+                  BRANCH="-s $SUKISU_COMMIT"
+                  echo "SukiSU 使用自定义提交: $SUKISU_COMMIT"
+                fi
               fi
             fi
           fi
 
           echo "BRANCH=$BRANCH" >> $GITHUB_ENV
-          echo "KSU 分支: $BRANCH"
+          echo "KSU_REF=$KSU_REF" >> $GITHUB_ENV
+          echo "KSU 分支参数: $BRANCH"
+          echo "ksu_ref=${KSU_REF}" >> $GITHUB_OUTPUT
+          echo "ksu_code=" >> $GITHUB_OUTPUT
 
+      # ============================================================
+      # ★ 改造点 C：「添加 KernelSU」
+      #   Official 分支：按 KSU_REF 精确取源码，读取/写入真实版本码，
+      #   替换前先探测目标字符串，避免旧版那种静默失败。
+      # ============================================================
       - name: 添加 KernelSU
         working-directory: ${{ env.KERNEL_ROOT }}
         run: |
           case "${{ inputs.ksu_variant }}" in
             "Official")
-              echo "添加 KernelSU 官方版..."
+              echo "添加 KernelSU 官方版 (ref: ${KSU_REF:-main})..."
               curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash $BRANCH
 
               cd KernelSU
-              KSU_GIT_VERSION=$(git rev-list --count HEAD)
-              KSU_VERSION=$((20000 + KSU_GIT_VERSION))
-              echo "KSU_VERSION=$KSU_VERSION" >> $GITHUB_ENV
 
-              if [ -f "kernel/Kbuild" ]; then
-                sed -i "s/DKSU_VERSION=16/DKSU_VERSION=${KSU_VERSION}/" kernel/Kbuild
+              # 若指定了 tag/commit，强制对齐到该 ref
+              if [ -n "${KSU_REF:-}" ]; then
+                if git fetch --depth=1 origin "refs/tags/${KSU_REF}" 2>/dev/null; then
+                  git checkout -q FETCH_HEAD
+                  echo "已对齐到 tag: $KSU_REF"
+                elif git fetch --depth=1 origin "${KSU_REF}" 2>/dev/null; then
+                  git checkout -q FETCH_HEAD
+                  echo "已对齐到 ref: $KSU_REF"
+                else
+                  echo "::error::无法检出 ${KSU_REF}，请检查该 tag/分支/commit 是否存在"
+                  exit 1
+                fi
               fi
+
+              echo "实际 commit: $(git rev-parse HEAD)"
+
+              # 读取源码自带的权威版本码（不再用 20000+commit数 自造）
+              KSU_VERSION=""
+              for f in kernel/Kbuild kernel/Makefile; do
+                if [ -f "$f" ]; then
+                  V=$(grep -oE '(DKSU_VERSION|KSU_VERSION)[[:space:]]*[:=]*[[:space:]]*[0-9]+' "$f" 2>/dev/null \
+                        | grep -oE '[0-9]+$' | head -n1 || true)
+                  if [ -n "$V" ]; then
+                    KSU_VERSION="$V"
+                    echo "从 $f 读到版本码: $KSU_VERSION"
+                    break
+                  fi
+                fi
+              done
+
+              # 源码里读不到静态版本码时的兜底。
+              # 注意：不要用 tag 去「推导」一个看起来合理的版本码——上游并未保证
+              # vX.Y.Z <-> X*10000+Y*100+Z 这种映射（实测 v3.2.653 按此算得 30853，
+              # 而内核真实值是 32653，映射不成立）。宁可留空并告警，也不要写错值。
+              if [ -z "$KSU_VERSION" ]; then
+                KSU_VERSION=$(git rev-list --count HEAD)
+                echo "::warning::kernel/Kbuild 与 kernel/Makefile 中均未找到静态版本码定义。"
+                echo "::warning::回退为 commit 数 $KSU_VERSION —— 该值仅供 artifact 命名，"
+                echo "::warning::不代表 KernelSU 真实版本，请以编译日志中 'KernelSU version:' 为准。"
+              fi
+
+              echo "KSU_VERSION=$KSU_VERSION" >> $GITHUB_ENV
+              echo "ksu_code=$KSU_VERSION" >> $GITHUB_OUTPUT
+
+              # 写入 Kbuild 前先确认目标存在，避免静默失败
+              if [ -f kernel/Kbuild ]; then
+                if grep -qE 'DKSU_VERSION[[:space:]]*[:=]*[[:space:]]*[0-9]+' kernel/Kbuild; then
+                  sed -i -E "s/(DKSU_VERSION[[:space:]]*[:=]*[[:space:]]*)[0-9]+/\1${KSU_VERSION}/" kernel/Kbuild
+                  echo "已写入 kernel/Kbuild: DKSU_VERSION=${KSU_VERSION}"
+                elif grep -qE 'KSU_VERSION[[:space:]]*[:=]*[[:space:]]*[0-9]+' kernel/Kbuild; then
+                  sed -i -E "s/(KSU_VERSION[[:space:]]*[:=]*[[:space:]]*)[0-9]+/\1${KSU_VERSION}/" kernel/Kbuild
+                  echo "已写入 kernel/Kbuild: KSU_VERSION=${KSU_VERSION}"
+                else
+                  echo "::warning::kernel/Kbuild 中无可替换的版本定义，内核将使用源码自带版本"
+                fi
+                echo "--- kernel/Kbuild 版本定义现状 ---"
+                grep -nE '(DKSU_VERSION|KSU_VERSION)' kernel/Kbuild || true
+              fi
+
               cd ..
               ;;
             "Next")
@@ -444,6 +564,23 @@ jobs:
             echo "KSU_LATEST_COMMIT_DATE=$KSU_LATEST_COMMIT_DATE" >> $GITHUB_ENV
           else
             echo "KSU_LATEST_COMMIT_DATE=未知" >> $GITHUB_ENV
+          fi
+
+          # 非 Official 变体的版本码也取出来，便于统一校验
+          if [ -z "${KSU_VERSION:-}" ] && [ -d "KernelSU" ]; then
+            V2=""
+            for f in KernelSU/kernel/Kbuild KernelSU/kernel/Makefile; do
+              if [ -f "$f" ]; then
+                V2=$(grep -oE '(DKSU_VERSION|KSU_VERSION)[[:space:]]*[:=]*[[:space:]]*[0-9]+' "$f" 2>/dev/null \
+                       | grep -oE '[0-9]+$' | head -n1 || true)
+                [ -n "$V2" ] && break
+              fi
+            done
+            if [ -n "$V2" ]; then
+              echo "KSU_VERSION=$V2" >> $GITHUB_ENV
+              echo "ksu_code=$V2" >> $GITHUB_OUTPUT
+              echo "版本码(非Official): $V2"
+            fi
           fi
 
       - name: 配置 SukiSU 管理器信息
@@ -1097,6 +1234,7 @@ jobs:
           command: |
             echo "当前 KSU 最新提交日期: ${KSU_LATEST_COMMIT_DATE}"
             echo "当前 SUSFS 最新提交日期: ${SUSFS_LATEST_COMMIT_DATE}"
+            echo "本次编入的 KSU 版本: ${KSU_VERSION:-未知}"
             set -ex
             cd "$KERNEL_ROOT"
 
